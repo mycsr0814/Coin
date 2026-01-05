@@ -1,0 +1,41 @@
+# 환경 변수 파일
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# 로그 파일
+*.log
+logs/
+*.log.*
+
+# 데이터 파일 (큰 CSV 파일)
+*.csv
+!requirements.txt
+
+# 백테스트 결과
+backtest_results/
+AutoTrading/Data/backtest_results/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 기타
+*.pem
+*.key
+
