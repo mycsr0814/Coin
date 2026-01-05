@@ -95,6 +95,9 @@ class LiveTradingBot:
         
         # 지표 계산
         df = self.strategy.calculate_indicators(df)
+        
+        # timestamp를 컬럼으로 변환하여 저장
+        df = df.reset_index()
         self.candle_data = df.to_dict('records')
         
         logger.info(f"캔들 데이터 {len(df)}개 수집 완료")
@@ -135,22 +138,27 @@ class LiveTradingBot:
     def update_candle_data(self, new_candle: Dict) -> bool:
         """캔들 데이터 업데이트"""
         try:
-            # 새 캔들 추가
-            df = pd.DataFrame(self.candle_data)
-            if len(df) > 0:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                df.set_index('timestamp', inplace=True)
+            # 기존 데이터를 DataFrame으로 변환
+            if len(self.candle_data) > 0:
+                df = pd.DataFrame(self.candle_data)
+                # timestamp가 인덱스인 경우 컬럼으로 변환
+                if 'timestamp' not in df.columns and df.index.name == 'timestamp':
+                    df = df.reset_index()
+                if 'timestamp' in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df.set_index('timestamp', inplace=True)
+            else:
+                df = pd.DataFrame()
             
             # 새 캔들 추가
             new_row = pd.DataFrame([{
-                'timestamp': pd.to_datetime(new_candle[0], unit='ms'),
                 'open': new_candle[1],
                 'high': new_candle[2],
                 'low': new_candle[3],
                 'close': new_candle[4],
                 'volume': new_candle[5]
-            }])
-            new_row.set_index('timestamp', inplace=True)
+            }], index=[pd.to_datetime(new_candle[0], unit='ms')])
+            new_row.index.name = 'timestamp'
             
             df = pd.concat([df, new_row])
             
@@ -160,11 +168,14 @@ class LiveTradingBot:
             
             # 지표 재계산
             df = self.strategy.calculate_indicators(df)
+            
+            # timestamp를 컬럼으로 변환하여 저장
+            df = df.reset_index()
             self.candle_data = df.to_dict('records')
             
             return True
         except Exception as e:
-            logger.error(f"캔들 데이터 업데이트 실패: {e}")
+            logger.error(f"캔들 데이터 업데이트 실패: {e}", exc_info=True)
             return False
     
     def check_entry_signal(self) -> Optional[str]:
