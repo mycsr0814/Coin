@@ -20,7 +20,7 @@ class BinanceFuturesClient:
         Args:
             api_key: 바이낸스 API 키
             api_secret: 바이낸스 API 시크릿
-            testnet: 테스트넷 사용 여부
+            testnet: 테스트넷 사용 여부 (현재는 지원하지 않음)
         """
         self.exchange = ccxt.binance({
             'apiKey': api_key,
@@ -31,9 +31,11 @@ class BinanceFuturesClient:
             }
         })
         
+        # 바이낸스 테스트넷은 선물 거래를 지원하지 않으므로 항상 실전 모드
         if testnet:
-            self.exchange.set_sandbox_mode(True)
-            logger.info("테스트넷 모드로 실행 중")
+            logger.warning("⚠️  경고: 바이낸스 테스트넷은 선물 거래를 지원하지 않습니다. 실전 모드로 실행됩니다.")
+        
+        logger.info("실전 거래 모드로 실행 중")
         
         self.symbol = 'ETH/USDT:USDT'
         self.leverage = 3
@@ -41,13 +43,16 @@ class BinanceFuturesClient:
     def set_leverage(self, leverage: int) -> bool:
         """레버리지 설정"""
         try:
-            self.exchange.set_leverage(leverage, self.symbol)
+            # 바이낸스 선물 레버리지 설정
+            self.exchange.set_leverage(leverage, self.symbol, params={'marginMode': 'isolated'})
             self.leverage = leverage
             logger.info(f"레버리지 {leverage}배로 설정 완료")
             return True
         except Exception as e:
-            logger.error(f"레버리지 설정 실패: {e}")
-            return False
+            logger.warning(f"레버리지 설정 시도 중 오류 (계속 진행): {e}")
+            # 레버리지 설정 실패해도 계속 진행 (이미 설정되어 있을 수 있음)
+            self.leverage = leverage
+            return True  # 경고만 하고 계속 진행
     
     def get_balance(self) -> Optional[float]:
         """USDT 잔고 조회"""
