@@ -1,0 +1,250 @@
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+
+# ==========================================
+# 설정 (안전형 하이브리드: 변동성 조절 모델)
+# ==========================================
+FILE_NAME = 'ETH_USDT_3m_3Y.csv' 
+INITIAL_CAPITAL = 20          
+LEVERAGE = 3                  
+FEE_RATE = 0.0005             
+
+# [자금 관리 핵심 - 리스크 고정]
+# 한 번의 트레이딩으로 잃을 수 있는 최대 금액을 자산의 N%로 제한
+# 20불의 5% = 1불. 즉, 손절 나가도 1불만 잃게 세팅.
+RISK_PER_TRADE = 0.05 
+
+# [전략 파라미터]
+CHOP_LEN = 14
+CHOP_THRESHOLD = 50 
+
+# 추세(Turtle)
+TURTLE_ENTRY = 20   
+TURTLE_EXIT = 10
+TURTLE_HARD_SL = 0.05 # 추세장이라도 -5%면 손절 (안전판)
+
+# 횡보(Range)
+BB_LEN = 20
+BB_STD = 2.0
+RANGE_SL = 0.02
+
+def resample_to_1h(df):
+    """3분봉 -> 1시간봉 변환"""
+    df.set_index('timestamp', inplace=True)
+    agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    df_1h = df.resample('1h').agg(agg).dropna()
+    df_1h.reset_index(inplace=True)
+    return df_1h
+
+def prepare_data(df):
+    print("지표 계산 중 (ATR 자금관리 적용)...")
+    
+    df = resample_to_1h(df)
+    
+    # 1. ATR (변동성 계산 - 자금관리용)
+    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    
+    # 2. CHOP Index
+    df['CHOP'] = ta.chop(df['high'], df['low'], df['close'], length=CHOP_LEN)
+    
+    # 3. Turtle
+    dc = ta.donchian(df['high'], df['low'], lower_length=TURTLE_ENTRY, upper_length=TURTLE_ENTRY)
+    dc_exit = ta.donchian(df['high'], df['low'], lower_length=TURTLE_EXIT, upper_length=TURTLE_EXIT)
+    
+    dcu = [c for c in dc.columns if c.startswith('DCU')][0]
+    dcl = [c for c in dc_exit.columns if c.startswith('DCL')][0]
+    
+    df['Turtle_High'] = dc[dcu].shift(1)
+    df['Turtle_Low'] = dc_exit[dcl].shift(1)
+    
+    # 4. Bollinger Bands
+    bb = ta.bbands(df['close'], length=BB_LEN, std=BB_STD)
+    bbu = [c for c in bb.columns if c.startswith('BBU')][0]
+    bbl = [c for c in bb.columns if c.startswith('BBL')][0]
+    bbm = [c for c in bb.columns if c.startswith('BBM')][0]
+    
+    df['BB_Upper'] = bb[bbu]
+    df['BB_Lower'] = bb[bbl]
+    df['BB_Mid'] = bb[bbm]
+    
+    df['RSI'] = ta.rsi(df['close'], length=14)
+    
+    return df.dropna()
+
+def calc_position_size(balance, price, atr, risk_per_trade, leverage):
+    """
+    [자금 관리 공식]
+    손절폭(Risk Distance) = 2 * ATR (변동성의 2배)
+    내가 감당할 손실금 = Balance * Risk_Ratio (예: 20불 * 5% = 1불)
+    매수 수량 = 감당할 손실금 / 손절폭
+    """
+    risk_distance = atr * 2
+    if risk_distance == 0: return 0
+    
+    risk_amount = balance * risk_per_trade
+    amount = risk_amount / risk_distance
+    
+    # 레버리지 한도 체크
+    # 계산된 수량이 내 잔고 * 레버리지를 초과하면 컷
+    max_amount = (balance * leverage) / price
+    amount = min(amount, max_amount)
+    
+    # 최소 주문 금액 체크 (약 5.1불)
+    if (amount * price) < 5.1:
+        # 소액일 땐 어쩔 수 없이 최소 금액으로 진입 (Risk 무시)
+        # 단, 잔고가 충분할 때만
+        if (balance * leverage) > 5.1:
+            amount = 5.2 / price
+        else:
+            amount = 0
+            
+    return amount
+
+def run_backtest():
+    try:
+        df_raw = pd.read_csv(FILE_NAME)
+        df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'])
+    except:
+        print("파일 없음. 3분봉 수집 코드 실행 필요.")
+        return
+
+    df = prepare_data(df_raw)
+    balance = INITIAL_CAPITAL
+    
+    position = None 
+    trades = []     
+    win_count = 0
+    loss_count = 0
+
+    print(f"--- 안전형 하이브리드 전략 테스트 ({len(df)} 캔들) ---")
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        curr_price = row['close']
+        
+        # 시장 상태
+        is_trend_mode = row['CHOP'] < CHOP_THRESHOLD
+        is_range_mode = not is_trend_mode
+        
+        # =========================================
+        # [A] 포지션 관리 (청산)
+        # =========================================
+        if position:
+            entry_price = position['entry_price']
+            amount = position['amount']
+            mode = position['mode']
+            
+            exit_price = 0
+            reason = ""
+            
+            # --- Turtle Mode ---
+            if mode == 'Turtle':
+                # 1. 추세 종료
+                if row['low'] < row['Turtle_Low']:
+                    exit_price = row['Turtle_Low']
+                    if row['open'] < exit_price: exit_price = row['open']
+                    reason = "Turtle Exit"
+                
+                # 2. [추가] 하드 스탑 (-5%)
+                elif row['low'] < entry_price * (1 - TURTLE_HARD_SL):
+                    exit_price = entry_price * (1 - TURTLE_HARD_SL)
+                    reason = "Turtle Hard SL"
+            
+            # --- Range Mode ---
+            elif mode == 'Range':
+                # 1. 익절
+                if row['high'] > row['BB_Mid']:
+                    exit_price = row['BB_Mid']
+                    reason = "Range TP"
+                # 2. 손절
+                elif row['low'] < entry_price * (1 - RANGE_SL):
+                    exit_price = entry_price * (1 - RANGE_SL)
+                    reason = "Range SL"
+            
+            if exit_price > 0:
+                pnl = (exit_price - entry_price) * amount - (exit_price * amount * FEE_RATE)
+                balance += pnl
+                
+                if pnl > 0: win_count += 1
+                else: loss_count += 1
+                
+                trades.append({
+                    'date': row['timestamp'],
+                    'type': reason,
+                    'pnl': pnl,
+                    'balance': balance,
+                    'mode': mode
+                })
+                position = None
+
+        # =========================================
+        # [B] 신규 진입 로직 (변동성 조절)
+        # =========================================
+        else:
+            if balance < 5: continue 
+            
+            # 진입 신호 확인
+            signal = False
+            mode = ""
+            entry_target = 0
+            
+            if is_trend_mode:
+                if row['high'] > row['Turtle_High']:
+                    signal = True
+                    mode = 'Turtle'
+                    entry_target = row['Turtle_High']
+                    if row['open'] > entry_target: entry_target = row['open']
+
+            elif is_range_mode:
+                if row['close'] < row['BB_Lower'] and row['RSI'] < 30:
+                    signal = True
+                    mode = 'Range'
+                    entry_target = curr_price
+            
+            # 진입 실행 (여기서 수량 조절)
+            if signal:
+                # [핵심] 변동성(ATR)에 따라 수량 계산
+                qty = calc_position_size(balance, entry_target, row['ATR'], RISK_PER_TRADE, LEVERAGE)
+                
+                if qty > 0:
+                    balance -= (entry_target * qty * FEE_RATE)
+                    position = {
+                        'entry_price': entry_target,
+                        'amount': qty,
+                        'mode': mode
+                    }
+
+    # 결과
+    trade_df = pd.DataFrame(trades)
+    if len(trades) == 0:
+        print("거래 없음")
+        return
+
+    total_return = ((balance - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
+    mdd = ((trade_df['balance'] - trade_df['balance'].cummax()) / trade_df['balance'].cummax() * 100).min()
+    
+    if (win_count + loss_count) > 0:
+        win_rate = win_count / (win_count + loss_count) * 100
+        avg_win = trade_df[trade_df['pnl'] > 0]['pnl'].mean()
+        avg_loss = trade_df[trade_df['pnl'] <= 0]['pnl'].mean()
+        rrr = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    else: win_rate = 0; rrr = 0
+
+    print("\n========== [안전형 하이브리드 (Volatility Targeting) 결과] ==========")
+    print(f"전략: CHOP 스위칭 + ATR 자금 관리 (리스크 고정)")
+    print(f"특징: MDD 대폭 감소 목표 / 안정적 우상향")
+    print(f"---------------------------------------------")
+    print(f"최종 자본: ${balance:,.2f} (초기 $20)")
+    print(f"수익률: {total_return:.2f}%")
+    print(f"거래 횟수: {len(trade_df)}회")
+    print(f"승률: {win_rate:.2f}%")
+    print(f"손익비(RRR): 1 : {rrr:.2f}")
+    print(f"MDD: {mdd:.2f}%")
+    print("=============================================")
+    
+    if len(trade_df) > 0:
+        print(trade_df.tail(10)[['date', 'type', 'pnl', 'balance']])
+
+if __name__ == "__main__":
+    run_backtest()

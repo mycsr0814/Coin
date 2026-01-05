@@ -1,0 +1,233 @@
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+
+# ==========================================
+# 설정 (고속 터틀: 기간 제한 해제 + 황금 세팅)
+# ==========================================
+FILE_NAME = 'ETH_USDT_1m_3Y.csv' 
+INITIAL_CAPITAL = 20          
+LEVERAGE = 3                  
+FEE_RATE = 0.001             
+
+# [자금 관리]
+# 검증된 8% 리스크 (EMA 필터가 지켜주므로 공격적으로)
+RISK_PER_TRADE = 0.08 
+
+# [전략 파라미터 - 88% 수익률의 핵심]
+CHOP_LEN = 14
+CHOP_THRESHOLD = 50 
+EMA_FILTER_LEN = 200  # 생존의 열쇠 (추세 필터)
+
+# [황금 파라미터]
+TURTLE_ENTRY = 10   # 진입: 10시간 고점 (빠름)
+TURTLE_EXIT = 5     # 청산: 5시간 저점 (매우 빠름, 수익 보존)
+TURTLE_HARD_SL = 0.05 
+
+# 횡보(Range)
+BB_LEN = 20
+BB_STD = 2.0
+RANGE_SL = 0.02
+RANGE_TARGET_RATIO = 0.9 
+MIN_BB_WIDTH = 0.005
+
+def resample_to_1h(df):
+    df.set_index('timestamp', inplace=True)
+    agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    df_1h = df.resample('1h').agg(agg).dropna()
+    df_1h.reset_index(inplace=True)
+    return df_1h
+
+def prepare_data(df):
+    print("지표 계산 중 (전체 기간 분석)...")
+    
+    df = resample_to_1h(df)
+    
+    # 1. EMA 200 (추세 필터)
+    df['EMA_Trend'] = ta.ema(df['close'], length=EMA_FILTER_LEN)
+    
+    # 2. ATR & CHOP
+    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    df['CHOP'] = ta.chop(df['high'], df['low'], df['close'], length=CHOP_LEN)
+    
+    # 3. Fast Turtle (10/5)
+    dc = ta.donchian(df['high'], df['low'], lower_length=TURTLE_ENTRY, upper_length=TURTLE_ENTRY)
+    dc_exit = ta.donchian(df['high'], df['low'], lower_length=TURTLE_EXIT, upper_length=TURTLE_EXIT)
+    
+    dcu = [c for c in dc.columns if c.startswith('DCU')][0]
+    dcl = [c for c in dc.columns if c.startswith('DCL')][0]
+    dcu_exit = [c for c in dc_exit.columns if c.startswith('DCU')][0]
+    dcl_exit = [c for c in dc_exit.columns if c.startswith('DCL')][0]
+    
+    df['Turtle_High_Entry'] = dc[dcu].shift(1)
+    df['Turtle_Low_Entry'] = dc[dcl].shift(1)
+    df['Turtle_High_Exit'] = dc_exit[dcu_exit].shift(1)
+    df['Turtle_Low_Exit'] = dc_exit[dcl_exit].shift(1)
+    
+    # 4. Bollinger Bands
+    bb = ta.bbands(df['close'], length=BB_LEN, std=BB_STD)
+    bbu_col = [c for c in bb.columns if c.startswith('BBU')][0]
+    bbl_col = [c for c in bb.columns if c.startswith('BBL')][0]
+    bbm_col = [c for c in bb.columns if c.startswith('BBM')][0]
+    
+    df['BB_Upper'] = bb[bbu_col]
+    df['BB_Lower'] = bb[bbl_col]
+    df['BB_Mid'] = bb[bbm_col]
+    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']
+    
+    # 5. StochRSI
+    stoch = ta.stochrsi(df['close'], length=14, rsi_length=14, k=3, d=3)
+    k_col = [c for c in stoch.columns if c.startswith('STOCHRSIk')][0]
+    df['Stoch_K'] = stoch[k_col]
+    
+    return df.dropna()
+
+def calc_position_size(balance, price, atr):
+    risk_distance = atr * 2
+    if risk_distance == 0: return 0
+    amount = (balance * RISK_PER_TRADE) / risk_distance
+    max_amount = (balance * LEVERAGE) / price
+    return min(amount, max_amount)
+
+def run_backtest():
+    try:
+        df_raw = pd.read_csv(FILE_NAME)
+        df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'])
+    except:
+        print("파일 없음.")
+        return
+
+    # [수정됨] 기간 필터링 로직 제거! (전체 데이터 사용)
+    # last_date = ... (삭제)
+    # df_raw = df_raw[...] (삭제)
+    
+    print(f"전체 기간 백테스팅 시작: {df_raw['timestamp'].min()} ~ {df_raw['timestamp'].max()}")
+
+    df = prepare_data(df_raw)
+    balance = INITIAL_CAPITAL
+    
+    position = None 
+    trades = []     
+    win_count = 0; loss_count = 0
+
+    print(f"--- 고속 터틀 (기간 제한 해제) 테스트 ({len(df)} 캔들) ---")
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        curr_price = row['close']
+        
+        # 시장 국면
+        is_trend = row['CHOP'] < CHOP_THRESHOLD
+        
+        # EMA 필터
+        is_bull_trend = curr_price > row['EMA_Trend']
+        is_bear_trend = curr_price < row['EMA_Trend']
+        
+        # [A] 청산
+        if position:
+            entry_price = position['entry_price']
+            amount = position['amount']
+            mode = position['mode']
+            p_type = position['type']
+            
+            exit_price = 0
+            reason = ""
+            
+            if mode == 'Turtle':
+                if p_type == 'Long':
+                    if row['low'] < row['Turtle_Low_Exit']:
+                        exit_price = row['Turtle_Low_Exit']
+                        if row['open'] < exit_price: exit_price = row['open']
+                        reason = "Fast Long Exit"
+                    elif row['low'] < entry_price * (1 - TURTLE_HARD_SL):
+                        exit_price = entry_price * (1 - TURTLE_HARD_SL); reason = "Hard SL"
+                elif p_type == 'Short':
+                    if row['high'] > row['Turtle_High_Exit']:
+                        exit_price = row['Turtle_High_Exit']
+                        if row['open'] > exit_price: exit_price = row['open']
+                        reason = "Fast Short Exit"
+                    elif row['high'] > entry_price * (1 + TURTLE_HARD_SL):
+                        exit_price = entry_price * (1 + TURTLE_HARD_SL); reason = "Hard SL"
+
+            elif mode == 'Range':
+                if p_type == 'Long':
+                    target = entry_price + (row['BB_Upper'] - entry_price) * RANGE_TARGET_RATIO
+                    if row['high'] > target: exit_price = target; reason = "Range TP"
+                    elif row['low'] < entry_price * (1 - RANGE_SL): exit_price = entry_price * (1 - RANGE_SL); reason = "Range SL"
+                elif p_type == 'Short':
+                    target = entry_price - (entry_price - row['BB_Lower']) * RANGE_TARGET_RATIO
+                    if row['low'] < target: exit_price = target; reason = "Range TP"
+                    elif row['high'] > entry_price * (1 + RANGE_SL): exit_price = entry_price * (1 + RANGE_SL); reason = "Range SL"
+
+            if exit_price > 0:
+                pnl = 0
+                if p_type == 'Long': pnl = (exit_price - entry_price) * amount
+                else: pnl = (entry_price - exit_price) * amount
+                pnl -= (exit_price * amount * FEE_RATE)
+                balance += pnl
+                if pnl > 0: win_count += 1
+                else: loss_count += 1
+                trades.append({'date': row['timestamp'], 'type': reason, 'pnl': pnl, 'balance': balance, 'mode': mode})
+                position = None
+
+        # [B] 진입
+        else:
+            if balance < 5: continue 
+            
+            signal = False; mode = ""; p_type = ""; target = 0
+            
+            # 1. 추세장 (Fast Turtle)
+            if is_trend:
+                if row['high'] > row['Turtle_High_Entry'] and is_bull_trend:
+                    signal = True; mode = 'Turtle'; p_type = 'Long'
+                    target = row['Turtle_High_Entry']
+                    if row['open'] > target: target = row['open']
+                
+                elif row['low'] < row['Turtle_Low_Entry'] and is_bear_trend:
+                    signal = True; mode = 'Turtle'; p_type = 'Short'
+                    target = row['Turtle_Low_Entry']
+                    if row['open'] < target: target = row['open']
+
+            # 2. 횡보장 (Range)
+            else:
+                if row['BB_Width'] > MIN_BB_WIDTH:
+                    if row['close'] < row['BB_Lower'] and row['Stoch_K'] < 20:
+                        signal = True; mode = 'Range'; p_type = 'Long'; target = curr_price
+                    elif row['close'] > row['BB_Upper'] and row['Stoch_K'] > 80:
+                        signal = True; mode = 'Range'; p_type = 'Short'; target = curr_price
+            
+            if signal:
+                qty = calc_position_size(balance, target, row['ATR'])
+                if (qty * target) >= 5.1:
+                    if p_type == 'Long': balance -= (target * qty * FEE_RATE)
+                    else: balance -= (target * qty * FEE_RATE)
+                    position = {'entry_price': target, 'amount': qty, 'mode': mode, 'type': p_type}
+
+    # 결과
+    trade_df = pd.DataFrame(trades)
+    if len(trades) == 0: print("거래 없음"); return
+
+    total_return = ((balance - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
+    mdd = ((trade_df['balance'] - trade_df['balance'].cummax()) / trade_df['balance'].cummax() * 100).min()
+    
+    if (win_count + loss_count) > 0:
+        win_rate = win_count / (win_count + loss_count) * 100
+        avg_win = trade_df[trade_df['pnl'] > 0]['pnl'].mean()
+        avg_loss = trade_df[trade_df['pnl'] <= 0]['pnl'].mean()
+        rrr = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    else: win_rate = 0; rrr = 0
+
+    print("\n========== [고속 터틀 (기간 제한 해제) 결과] ==========")
+    print(f"전략: Fast Turtle(10/5) + EMA Filter")
+    print(f"---------------------------------------------")
+    print(f"최종 자본: ${balance:,.2f} (초기 $20)")
+    print(f"수익률: {total_return:.2f}%")
+    print(f"거래 횟수: {len(trade_df)}회")
+    print(f"승률: {win_rate:.2f}%")
+    print(f"손익비(RRR): 1 : {rrr:.2f}")
+    print(f"MDD: {mdd:.2f}%")
+    print("=============================================")
+    if len(trade_df) > 0: print(trade_df.tail(10)[['date', 'type', 'pnl', 'balance']])
+
+if __name__ == "__main__":
+    run_backtest()

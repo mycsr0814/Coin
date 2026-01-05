@@ -1,0 +1,258 @@
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+
+# 1. 3분봉 데이터 불러오기 (작성하신 코드로 만든 csv 파일)
+FILE_NAME = 'ETH_USDT_3m_3Y.csv' 
+df_3m = pd.read_csv(FILE_NAME)
+df_3m['timestamp'] = pd.to_datetime(df_3m['timestamp'])
+df_3m.set_index('timestamp', inplace=True)
+
+# =================================================
+# [핵심] 3분 데이터로 15분, 1시간 데이터 만들기 (Resampling)
+# =================================================
+
+# 함수: 작은 봉을 뭉쳐서 큰 봉으로 만드는 로직
+def resample_candles(df, timeframe):
+    agg_dict = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }
+    return df.resample(timeframe).agg(agg_dict).dropna()
+
+# 15분 봉 생성
+df_15m = resample_candles(df_3m, '15min')
+
+# 1시간 봉 생성
+df_1h = resample_candles(df_3m, '1h')
+
+print(f"3분봉 개수: {len(df_3m)}")   # 약 52만개
+print(f"15분봉 개수: {len(df_15m)}") # 약 10만개
+print(f"1시간봉 개수: {len(df_1h)}")  # 약 2.6만개
+
+# =================================================
+# [지표 계산] 각 타임프레임별로 필요한 지표 계산
+# =================================================
+
+# 1. 1시간 봉: 추세 파악용 (200 EMA)
+df_1h['EMA_200_1h'] = ta.ema(df_1h['close'], length=200)
+
+# 2. 15분 봉: 모멘텀 파악용 (RSI)
+df_15m['RSI_15m'] = ta.rsi(df_15m['close'], length=14)
+
+# 3. 3분 봉: 진입 타점용 (VWAP + 거래량)
+# (주의: VWAP은 3분봉에서 직접 계산하거나, 15분봉 걸 가져와도 됨)
+df_3m['Vol_MA'] = df_3m['volume'].rolling(20).mean()
+
+# =================================================
+# [데이터 합치기] '3분봉' 기준으로 정렬 (merge_asof 사용)
+# =================================================
+
+# 인덱스를 컬럼으로 리셋
+df_3m = df_3m.reset_index()
+df_15m = df_15m.reset_index()[['timestamp', 'RSI_15m']] # 필요한 컬럼만
+df_1h = df_1h.reset_index()[['timestamp', 'EMA_200_1h']]
+
+# 정렬
+df_3m = df_3m.sort_values('timestamp')
+df_15m = df_15m.sort_values('timestamp')
+df_1h = df_1h.sort_values('timestamp')
+
+# 1. 3분봉 + 15분봉 합치기
+df_merged = pd.merge_asof(df_3m, df_15m, on='timestamp', direction='backward')
+
+# 2. 그 결과에 + 1시간봉 합치기
+df_final = pd.merge_asof(df_merged, df_1h, on='timestamp', direction='backward')
+
+# 결측치 제거
+df_final.dropna(inplace=True)
+
+print("데이터 준비 완료! 멀티 타임프레임 분석 시작")
+print(df_final.head())
+
+# ==========================================
+# 설정 (터틀 트레이딩: 고손익비 전략)
+# ==========================================
+FILE_NAME = 'ETH_USDT_3m_3Y.csv' 
+INITIAL_CAPITAL = 20          
+LEVERAGE = 3                  
+FEE_RATE = 0.0005             
+
+# [자금 관리]
+# 추세 추종은 연패할 수 있으므로 시드의 95% 투입하되, 손절은 확실하게
+ENTRY_RATIO = 0.95 
+
+# [전략 파라미터]
+ENTRY_PERIOD = 20  # 20시간 고점 돌파 시 진입
+EXIT_PERIOD = 10   # 10시간 저점 이탈 시 청산 (트레일링 스탑)
+ADX_THRESHOLD = 25 # 추세 강도 필터
+
+def resample_to_1h(df):
+    """3분봉 -> 1시간봉 변환"""
+    df.set_index('timestamp', inplace=True)
+    agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    df_1h = df.resample('1h').agg(agg).dropna()
+    df_1h.reset_index(inplace=True)
+    return df_1h
+
+def prepare_data(df):
+    print("1시간봉 변환 및 돈키안 채널 계산 중...")
+    
+    # 1. 3분 -> 1시간 리샘플링
+    df = resample_to_1h(df)
+    
+    # 2. 돈키안 채널 (Donchian Channel)
+    # 진입용: 20시간
+    dc_entry = ta.donchian(df['high'], df['low'], lower_length=ENTRY_PERIOD, upper_length=ENTRY_PERIOD)
+    # 청산용: 10시간
+    dc_exit = ta.donchian(df['high'], df['low'], lower_length=EXIT_PERIOD, upper_length=EXIT_PERIOD)
+    
+    # 컬럼명 매핑 (pandas_ta 동적 이름 처리)
+    # DCU: Upper(고점), DCL: Lower(저점)
+    # shift(1)을 해야 '현재 봉'이 아닌 '직전 봉까지의 고점/저점'을 가져옴 (미래 참조 방지)
+    
+    # 진입 라인 (20시간 고점)
+    entry_upper_col = [c for c in dc_entry.columns if c.startswith('DCU')][0]
+    df['Entry_Line'] = dc_entry[entry_upper_col].shift(1)
+    
+    # 청산 라인 (10시간 저점)
+    exit_lower_col = [c for c in dc_exit.columns if c.startswith('DCL')][0]
+    df['Exit_Line'] = dc_exit[exit_lower_col].shift(1)
+    
+    # 3. ADX (추세 강도)
+    adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+    adx_col = [c for c in adx.columns if c.startswith('ADX')][0]
+    df['ADX'] = adx[adx_col]
+    
+    return df.dropna()
+
+def run_backtest():
+    try:
+        df_raw = pd.read_csv(FILE_NAME)
+        df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'])
+    except:
+        print("파일이 없습니다. 3분봉 수집 코드를 먼저 실행하세요.")
+        return
+
+    df = prepare_data(df_raw)
+    balance = INITIAL_CAPITAL
+    
+    position = None 
+    trades = []     
+    win_count = 0
+    loss_count = 0
+
+    print(f"--- 터틀 트레이딩 (손익비 중심) 테스트 ({len(df)} 캔들) ---")
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        curr_price = row['close']
+        
+        # =========================================
+        # [A] 포지션 청산 로직 (Trailing Stop)
+        # =========================================
+        if position:
+            entry_price = position['entry_price']
+            amount = position['amount']
+            
+            # 터틀 전략의 핵심: 
+            # 가격이 '최근 10시간 저점(Exit_Line)'을 깨고 내려가면 뒤도 안 돌아보고 팜.
+            # 이것이 손절이자 익절임. (추세가 꺾였다는 신호)
+            
+            if row['low'] < row['Exit_Line']:
+                # 청산 가격은 Exit Line 가격 (혹은 갭락 시 시가)
+                exit_price = row['Exit_Line']
+                if row['open'] < exit_price:
+                    exit_price = row['open']
+                    
+                pnl = (exit_price - entry_price) * amount - (exit_price * amount * FEE_RATE)
+                balance += pnl
+                
+                # 손익 기록
+                if pnl > 0: 
+                    win_count += 1
+                    reason = "Trend Follow Win"
+                else: 
+                    loss_count += 1
+                    reason = "Trend End Loss" # 추세가 안 나오고 꺾임 (작은 손실)
+                
+                trades.append({
+                    'date': row['timestamp'],
+                    'type': reason,
+                    'pnl': pnl,
+                    'balance': balance,
+                    'holding_time': (row['timestamp'] - position['entry_date']).total_seconds() / 3600 # 시간 단위
+                })
+                position = None
+
+        # =========================================
+        # [B] 신규 진입 로직 (Breakout)
+        # =========================================
+        else:
+            # 1. 돌파: 현재 고가(High)가 20시간 고점(Entry_Line)을 뚫음
+            # 2. 필터: ADX > 25 (추세가 강할 때만)
+            # 3. 잔고: 5불 이상
+            
+            cond_breakout = row['high'] > row['Entry_Line']
+            cond_adx = row['ADX'] > ADX_THRESHOLD
+            
+            if cond_breakout and cond_adx and balance > 5:
+                # 돌파 가격(Entry Line)에서 매수했다고 가정
+                # (실제로는 돌파하는 순간 시장가 진입)
+                buy_price = row['Entry_Line']
+                # 만약 시가가 이미 돌파해있으면 시가로 진입
+                if row['open'] > buy_price:
+                    buy_price = row['open']
+                
+                invest_money = balance * ENTRY_RATIO
+                purchasing_power = invest_money * LEVERAGE
+                amount = purchasing_power / buy_price
+                
+                balance -= (buy_price * amount * FEE_RATE)
+                
+                position = {
+                    'entry_price': buy_price,
+                    'amount': amount,
+                    'entry_date': row['timestamp']
+                }
+
+    # 결과 출력
+    trade_df = pd.DataFrame(trades)
+    if len(trades) == 0:
+        print("거래 없음")
+        return
+
+    total_return = ((balance - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
+    mdd = ((trade_df['balance'] - trade_df['balance'].cummax()) / trade_df['balance'].cummax() * 100).min()
+    
+    if (win_count + loss_count) > 0:
+        win_rate = win_count / (win_count + loss_count) * 100
+        avg_win = trade_df[trade_df['pnl'] > 0]['pnl'].mean()
+        avg_loss = trade_df[trade_df['pnl'] <= 0]['pnl'].mean()
+        # 손익비 계산 (평균 수익 / 평균 손실의 절대값)
+        rrr = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    else: 
+        win_rate = 0
+        rrr = 0
+
+    print("\n========== [터틀 트레이딩 (Trend Following) 결과] ==========")
+    print(f"전략: 20시간 신고가 진입 / 10시간 신저가 청산")
+    print(f"목표: 승률은 낮아도 손익비(RRR)로 승부")
+    print(f"---------------------------------------------")
+    print(f"최종 자본: ${balance:,.2f} (초기 $20)")
+    print(f"수익률: {total_return:.2f}%")
+    print(f"거래 횟수: {len(trade_df)}회")
+    print(f"승률: {win_rate:.2f}%")
+    print(f"손익비(RRR): 1 : {rrr:.2f}")
+    print(f"MDD: {mdd:.2f}%")
+    print("=============================================")
+    
+    if len(trade_df) > 0:
+        print("\n[최근 거래 기록]")
+        print(trade_df.tail(10)[['date', 'type', 'pnl', 'balance']])
+
+if __name__ == "__main__":
+    run_backtest()

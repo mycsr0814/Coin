@@ -1,0 +1,272 @@
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+
+# ==========================================
+# 설정 (Pro 버전: 횡보장 양방향 매매 추가)
+# ==========================================
+FILE_NAME = 'ETH_USDT_3m_3Y.csv' 
+INITIAL_CAPITAL = 20          
+LEVERAGE = 3                  
+FEE_RATE = 0.0005             
+
+# [자금 관리 - 리스크 고정]
+RISK_PER_TRADE = 0.05 
+
+# [전략 파라미터]
+CHOP_LEN = 14
+CHOP_THRESHOLD = 50 
+
+# 추세(Turtle) - Long Only
+TURTLE_ENTRY = 20   
+TURTLE_EXIT = 10
+TURTLE_HARD_SL = 0.05 
+
+# 횡보(Range) - Long & Short
+BB_LEN = 20
+BB_STD = 2.0
+RANGE_SL = 0.02     
+
+def resample_to_1h(df):
+    """3분봉 -> 1시간봉 변환"""
+    df.set_index('timestamp', inplace=True)
+    agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    df_1h = df.resample('1h').agg(agg).dropna()
+    df_1h.reset_index(inplace=True)
+    return df_1h
+
+def prepare_data(df):
+    print("지표 계산 중 (StochRSI + Long/Short)...")
+    
+    df = resample_to_1h(df)
+    
+    # 1. ATR (자금관리)
+    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    
+    # 2. CHOP (시장 판독)
+    df['CHOP'] = ta.chop(df['high'], df['low'], df['close'], length=CHOP_LEN)
+    
+    # 3. Turtle (추세용)
+    dc = ta.donchian(df['high'], df['low'], lower_length=TURTLE_ENTRY, upper_length=TURTLE_ENTRY)
+    dc_exit = ta.donchian(df['high'], df['low'], lower_length=TURTLE_EXIT, upper_length=TURTLE_EXIT)
+    
+    dcu = [c for c in dc.columns if c.startswith('DCU')][0]
+    dcl = [c for c in dc_exit.columns if c.startswith('DCL')][0]
+    
+    df['Turtle_High'] = dc[dcu].shift(1)
+    df['Turtle_Low'] = dc_exit[dcl].shift(1)
+    
+    # 4. Bollinger Bands (횡보용)
+    bb = ta.bbands(df['close'], length=BB_LEN, std=BB_STD)
+    bbu = [c for c in bb.columns if c.startswith('BBU')][0]
+    bbl = [c for c in bb.columns if c.startswith('BBL')][0]
+    bbm = [c for c in bb.columns if c.startswith('BBM')][0]
+    
+    df['BB_Upper'] = bb[bbu]
+    df['BB_Lower'] = bb[bbl]
+    df['BB_Mid'] = bb[bbm]
+    
+    # 5. [업그레이드] StochRSI (민감한 횡보 지표)
+    stoch = ta.stochrsi(df['close'], length=14, rsi_length=14, k=3, d=3)
+    k_col = [c for c in stoch.columns if c.startswith('STOCHRSIk')][0]
+    d_col = [c for c in stoch.columns if c.startswith('STOCHRSId')][0]
+    
+    df['Stoch_K'] = stoch[k_col]
+    df['Stoch_D'] = stoch[d_col]
+    
+    return df.dropna()
+
+def calc_position_size(balance, price, atr, risk_per_trade, leverage):
+    risk_distance = atr * 2
+    if risk_distance == 0: return 0
+    
+    risk_amount = balance * risk_per_trade
+    amount = risk_amount / risk_distance
+    
+    max_amount = (balance * leverage) / price
+    amount = min(amount, max_amount)
+    
+    if (amount * price) < 5.1:
+        if (balance * leverage) > 5.1:
+            amount = 5.2 / price
+        else:
+            amount = 0
+    return amount
+
+def run_backtest():
+    try:
+        df_raw = pd.read_csv(FILE_NAME)
+        df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'])
+    except:
+        print("파일 없음. 3분봉 수집 코드 실행 필요.")
+        return
+
+    df = prepare_data(df_raw)
+    balance = INITIAL_CAPITAL
+    
+    position = None 
+    trades = []     
+    win_count = 0
+    loss_count = 0
+
+    print(f"--- Pro 하이브리드 전략 테스트 ({len(df)} 캔들) ---")
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        curr_price = row['close']
+        
+        # 시장 상태
+        is_trend_mode = row['CHOP'] < CHOP_THRESHOLD
+        is_range_mode = not is_trend_mode
+        
+        # =========================================
+        # [A] 포지션 관리 (청산)
+        # =========================================
+        if position:
+            entry_price = position['entry_price']
+            amount = position['amount']
+            mode = position['mode']
+            pos_type = position['type'] # 'Long' or 'Short'
+            
+            exit_price = 0
+            reason = ""
+            
+            # --- Turtle (Long Only) ---
+            if mode == 'Turtle':
+                if row['low'] < row['Turtle_Low']:
+                    exit_price = row['Turtle_Low']
+                    if row['open'] < exit_price: exit_price = row['open']
+                    reason = "Turtle Exit"
+                elif row['low'] < entry_price * (1 - TURTLE_HARD_SL):
+                    exit_price = entry_price * (1 - TURTLE_HARD_SL)
+                    reason = "Turtle Hard SL"
+            
+            # --- Range (Long & Short) ---
+            elif mode == 'Range':
+                if pos_type == 'Long':
+                    # 익절: 중간선 도달
+                    if row['high'] > row['BB_Mid']:
+                        exit_price = row['BB_Mid']
+                        reason = "Range Long TP"
+                    # 손절
+                    elif row['low'] < entry_price * (1 - RANGE_SL):
+                        exit_price = entry_price * (1 - RANGE_SL)
+                        reason = "Range Long SL"
+                        
+                elif pos_type == 'Short':
+                    # 익절: 중간선 도달 (가격이 내려와야 함)
+                    if row['low'] < row['BB_Mid']:
+                        exit_price = row['BB_Mid']
+                        reason = "Range Short TP"
+                    # 손절 (가격이 올라가면 손해)
+                    elif row['high'] > entry_price * (1 + RANGE_SL):
+                        exit_price = entry_price * (1 + RANGE_SL)
+                        reason = "Range Short SL"
+
+            # 청산 계산
+            if exit_price > 0:
+                pnl = 0
+                if pos_type == 'Long':
+                    pnl = (exit_price - entry_price) * amount
+                elif pos_type == 'Short':
+                    pnl = (entry_price - exit_price) * amount # 숏은 떨어져야 이득
+                
+                # 수수료 차감
+                fee = (exit_price * amount) * FEE_RATE
+                pnl -= fee
+                balance += pnl
+                
+                if pnl > 0: win_count += 1
+                else: loss_count += 1
+                
+                trades.append({
+                    'date': row['timestamp'],
+                    'type': reason,
+                    'pnl': pnl,
+                    'balance': balance,
+                    'mode': mode
+                })
+                position = None
+
+        # =========================================
+        # [B] 신규 진입 로직
+        # =========================================
+        else:
+            if balance < 5: continue 
+            
+            signal = False
+            mode = ""
+            pos_type = "" # 'Long' or 'Short'
+            entry_target = 0
+            
+            # 1. 추세장 (Turtle - Long Only)
+            if is_trend_mode:
+                if row['high'] > row['Turtle_High']:
+                    signal = True
+                    mode = 'Turtle'
+                    pos_type = 'Long'
+                    entry_target = row['Turtle_High']
+                    if row['open'] > entry_target: entry_target = row['open']
+
+            # 2. 횡보장 (Range - Long & Short)
+            elif is_range_mode:
+                # Long: 밴드 하단 + StochRSI < 20 (과매도)
+                if row['close'] < row['BB_Lower'] and row['Stoch_K'] < 20:
+                    signal = True
+                    mode = 'Range'
+                    pos_type = 'Long'
+                    entry_target = curr_price
+                
+                # Short: 밴드 상단 + StochRSI > 80 (과매수)
+                elif row['close'] > row['BB_Upper'] and row['Stoch_K'] > 80:
+                    signal = True
+                    mode = 'Range'
+                    pos_type = 'Short'
+                    entry_target = curr_price
+            
+            if signal:
+                qty = calc_position_size(balance, entry_target, row['ATR'], RISK_PER_TRADE, LEVERAGE)
+                
+                if qty > 0:
+                    # 진입 수수료
+                    balance -= (entry_target * qty * FEE_RATE)
+                    position = {
+                        'entry_price': entry_target,
+                        'amount': qty,
+                        'mode': mode,
+                        'type': pos_type
+                    }
+
+    # 결과 출력
+    trade_df = pd.DataFrame(trades)
+    if len(trades) == 0:
+        print("거래 없음")
+        return
+
+    total_return = ((balance - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
+    mdd = ((trade_df['balance'] - trade_df['balance'].cummax()) / trade_df['balance'].cummax() * 100).min()
+    
+    if (win_count + loss_count) > 0:
+        win_rate = win_count / (win_count + loss_count) * 100
+        avg_win = trade_df[trade_df['pnl'] > 0]['pnl'].mean()
+        avg_loss = trade_df[trade_df['pnl'] <= 0]['pnl'].mean()
+        rrr = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    else: win_rate = 0; rrr = 0
+
+    print("\n========== [Pro 하이브리드 (Range Short 추가) 결과] ==========")
+    print(f"전략: Trend(Long) + Range(Long/Short) + ATR 자금관리")
+    print(f"목표: 횡보장에서 양방향 수익 창출")
+    print(f"---------------------------------------------")
+    print(f"최종 자본: ${balance:,.2f} (초기 $20)")
+    print(f"수익률: {total_return:.2f}%")
+    print(f"거래 횟수: {len(trade_df)}회")
+    print(f"승률: {win_rate:.2f}%")
+    print(f"손익비(RRR): 1 : {rrr:.2f}")
+    print(f"MDD: {mdd:.2f}%")
+    print("=============================================")
+    
+    if len(trade_df) > 0:
+        print(trade_df.tail(10)[['date', 'type', 'pnl', 'balance']])
+
+if __name__ == "__main__":
+    run_backtest()

@@ -1,0 +1,183 @@
+import pandas as pd
+import numpy as np
+
+# ===============================
+# 설정
+# ===============================
+CSV_PATH = "ETH_USDT_1m_3Y.csv"
+START_DATE = "2023-01-01"
+
+INITIAL_CAPITAL = 20.0
+RISK_PER_TRADE = 0.007
+TAKER_FEE = 0.0004
+
+DONCHIAN_LEN = 55
+ATR_LEN = 14
+EMA_FAST = 20
+EMA_SLOW = 60
+
+PARTIAL_RATIO = 0.5
+TRAIL_ATR_MULT = 1.0
+
+# 시장 상태별 TP/SL 비율
+TP_SL_CONFIG = {
+    'uptrend':   {'TP1': 1.0, 'TP2': 1.5, 'LEVERAGE': 5},
+    'downtrend': {'TP1': 1.0, 'TP2': 1.5, 'LEVERAGE': 5},
+    'range':     {'TP1': 0.5, 'TP2': 1.0, 'LEVERAGE': 3}
+}
+
+# ===============================
+# 데이터 로드 & 1H 리샘플
+# ===============================
+df_raw = pd.read_csv(CSV_PATH)
+col = 'timestamp' if 'timestamp' in df_raw.columns else 'time'
+df_raw[col] = pd.to_datetime(df_raw[col])
+df = df_raw.set_index(col).sort_index().loc[START_DATE:]
+
+df = df.resample("1h").agg({
+    'open':'first','high':'max','low':'min','close':'last','volume':'sum'
+}).dropna()
+
+# ===============================
+# 지표 계산
+# ===============================
+df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+df['don_high'] = df['high'].rolling(DONCHIAN_LEN).max().shift(1)
+df['don_low'] = df['low'].rolling(DONCHIAN_LEN).min().shift(1)
+
+tr = pd.concat([
+    df['high'] - df['low'],
+    (df['high'] - df['close'].shift()).abs(),
+    (df['low'] - df['close'].shift()).abs()
+], axis=1).max(axis=1)
+df['atr'] = tr.rolling(ATR_LEN).mean()
+df['atr_ma'] = df['atr'].rolling(100).mean()
+
+# ===============================
+# 백테스트
+# ===============================
+capital = INITIAL_CAPITAL
+equity_curve = []
+trades_detail = []
+
+in_pos = False
+pos_type, entry, stop, tp1, tp2 = None, 0, 0, 0, 0
+size, remain_size, tp1_done, extremum_price = 0, 0, False, 0
+loss_streak = max_loss_streak = 0
+
+for i in range(len(df)):
+    row = df.iloc[i]
+    equity_curve.append(capital)
+
+    if np.isnan(row['don_high']) or np.isnan(row['atr']):
+        continue
+
+    # === 시장 상태 판단 ===
+    atr_ratio = row['atr'] / row['atr_ma'] if row['atr_ma'] > 0 else 0
+    if atr_ratio < 0.8:
+        market_state = 'range'
+    elif row['ema_fast'] > row['ema_slow']:
+        market_state = 'uptrend'
+    else:
+        market_state = 'downtrend'
+
+    tp1_ratio = TP_SL_CONFIG[market_state]['TP1']
+    tp2_ratio = TP_SL_CONFIG[market_state]['TP2']
+    leverage = TP_SL_CONFIG[market_state]['LEVERAGE']
+
+    # === 포지션 진입 ===
+    if not in_pos:
+        long_cond = row['close'] > row['don_high'] and row['ema_fast'] > row['ema_slow']
+        short_cond = row['close'] < row['don_low'] and row['ema_fast'] < row['ema_slow']
+        side = 'long' if long_cond else ('short' if short_cond else None)
+
+        if side:
+            pos_type = side
+            entry, r = row['close'], row['atr']
+            if r <= 0: continue
+
+            size = (capital * RISK_PER_TRADE) / r
+            remain_size = size
+            in_pos, tp1_done = True, False
+
+            if pos_type == 'long':
+                stop, tp1, tp2 = entry - r, entry + r*tp1_ratio, entry + r*tp2_ratio
+                extremum_price = entry
+            else:
+                stop, tp1, tp2 = entry + r, entry - r*tp1_ratio, entry - r*tp2_ratio
+                extremum_price = entry
+
+    # === 포지션 관리 ===
+    else:
+        pnl_now = 0
+        exit_triggered, exit_price, exit_reason = False, 0, ""
+
+        if pos_type == 'long':
+            extremum_price = max(extremum_price, row['high'])
+            if not tp1_done and row['high'] >= tp1:
+                c_size = remain_size * PARTIAL_RATIO
+                pnl_now += (tp1 - entry) * c_size * leverage - (entry + tp1) * c_size * TAKER_FEE
+                remain_size -= c_size
+                stop, tp1_done = entry, True
+            if tp1_done: stop = max(stop, extremum_price - row['atr']*TRAIL_ATR_MULT)
+
+            if row['high'] >= tp2: exit_price, exit_triggered, exit_reason = tp2, True, "익절(TP2)"
+            elif row['low'] <= stop: exit_price, exit_triggered, exit_reason = stop, True, "손절/트레일"
+            elif tp1_done and row['close'] < row['ema_slow']: exit_price, exit_triggered, exit_reason = row['close'], True, "추세반전(EMA)"
+
+        else:
+            extremum_price = min(extremum_price, row['low'])
+            if not tp1_done and row['low'] <= tp1:
+                c_size = remain_size * PARTIAL_RATIO
+                pnl_now += (entry - tp1) * c_size * leverage - (entry + tp1) * c_size * TAKER_FEE
+                remain_size -= c_size
+                stop, tp1_done = entry, True
+            if tp1_done: stop = min(stop, extremum_price + row['atr']*TRAIL_ATR_MULT)
+
+            if row['low'] <= tp2: exit_price, exit_triggered, exit_reason = tp2, True, "익절(TP2)"
+            elif row['high'] >= stop: exit_price, exit_triggered, exit_reason = stop, True, "손절/트레일"
+            elif tp1_done and row['close'] > row['ema_slow']: exit_price, exit_triggered, exit_reason = row['close'], True, "추세반전(EMA)"
+
+        capital += pnl_now
+        if exit_triggered:
+            final_pnl = (exit_price - entry if pos_type=='long' else entry - exit_price) * remain_size * leverage
+            final_pnl -= (entry + exit_price) * remain_size * TAKER_FEE
+            total_pnl = pnl_now + final_pnl
+            capital += final_pnl
+
+            trades_detail.append({'exit_time': row.name,'type':pos_type,'pnl':total_pnl,'reason':exit_reason})
+            if total_pnl < 0:
+                loss_streak += 1
+                max_loss_streak = max(max_loss_streak, loss_streak)
+            else:
+                loss_streak = 0
+            in_pos = False
+
+# ===============================
+# 리포트
+# ===============================
+eq = pd.Series(equity_curve, index=df.index[:len(equity_curve)])
+mdd = ((eq - eq.cummax()) / eq.cummax() * 100).min()
+monthly_ret = eq.resample('ME').last().pct_change()*100
+yearly_ret = eq.resample('YE').last().pct_change()*100
+
+print("\n" + "="*60)
+print(f"◈ ETH 하이브리드 전략 + 시장 상태별 최적화 ({START_DATE} ~ )")
+print("="*60)
+print(f"- 최종 자본: ${capital:.2f}")
+print(f"- 총 수익률: {((capital-INITIAL_CAPITAL)/INITIAL_CAPITAL*100):.2f}%")
+print(f"- 최대 낙폭(MDD): {mdd:.2f}%")
+print(f"- 총 거래 수: {len(trades_detail)}")
+print(f"- 승률: {(np.mean([t['pnl']>0 for t in trades_detail])*100):.2f}%")
+print(f"- 최대 연속 손실: {max_loss_streak}회")
+
+print("\n[연도별 수익률]")
+print(yearly_ret.dropna().to_string(float_format="{:.2f}%".format))
+
+print("\n[월별 성과 상/하위 3]")
+print("<< 최악의 달 >>")
+print(monthly_ret.sort_values().head(3).to_string(header=False, float_format="{:.2f}%".format))
+print("\n<< 최고의 달 >>")
+print(monthly_ret.sort_values(ascending=False).head(3).to_string(header=False, float_format="{:.2f}%".format))
+print("="*60)

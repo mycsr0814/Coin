@@ -1,0 +1,220 @@
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+
+# ==========================================
+# 설정 (하이브리드: 추세 + 횡보 자동 전환)
+# ==========================================
+FILE_NAME = 'ETH_USDT_3m_3Y.csv' 
+INITIAL_CAPITAL = 20          
+LEVERAGE = 3                  
+FEE_RATE = 0.0005             
+
+# [자금 관리]
+ENTRY_RATIO = 0.90 
+
+# [전략 파라미터]
+CHOP_LEN = 14
+CHOP_THRESHOLD = 50 # 50 이상: 횡보 / 50 미만: 추세
+
+# 추세장(Turtle)
+TURTLE_ENTRY = 20   
+TURTLE_EXIT = 10    
+
+# 횡보장(Range)
+BB_LEN = 20
+BB_STD = 2.0
+RANGE_SL = 0.02     
+
+def resample_to_1h(df):
+    """3분봉 -> 1시간봉 변환"""
+    df.set_index('timestamp', inplace=True)
+    agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    df_1h = df.resample('1h').agg(agg).dropna()
+    df_1h.reset_index(inplace=True)
+    return df_1h
+
+def prepare_data(df):
+    print("지표 계산 중 (Choppiness Index + Turtle + BB)...")
+    
+    df = resample_to_1h(df)
+    
+    # --- 1. 시장 판독기: Choppiness Index (수정된 부분) ---
+    # ta.chop은 Series를 반환하므로 바로 할당합니다.
+    df['CHOP'] = ta.chop(df['high'], df['low'], df['close'], length=CHOP_LEN)
+    
+    # --- 2. 추세 모드 지표 (Turtle) ---
+    dc = ta.donchian(df['high'], df['low'], lower_length=TURTLE_ENTRY, upper_length=TURTLE_ENTRY)
+    dc_exit = ta.donchian(df['high'], df['low'], lower_length=TURTLE_EXIT, upper_length=TURTLE_EXIT)
+    
+    # Donchian은 DataFrame을 반환하므로 컬럼 찾기 유지
+    dcu_col = [c for c in dc.columns if c.startswith('DCU')][0]
+    dcl_exit_col = [c for c in dc_exit.columns if c.startswith('DCL')][0]
+    
+    # 진입/청산 라인 (직전 봉 기준)
+    df['Turtle_High'] = dc[dcu_col].shift(1)
+    df['Turtle_Low'] = dc_exit[dcl_exit_col].shift(1)
+    
+    # --- 3. 횡보 모드 지표 (Bollinger Bands) ---
+    bb = ta.bbands(df['close'], length=BB_LEN, std=BB_STD)
+    bbu_col = [c for c in bb.columns if c.startswith('BBU')][0]
+    bbl_col = [c for c in bb.columns if c.startswith('BBL')][0]
+    bbm_col = [c for c in bb.columns if c.startswith('BBM')][0]
+    
+    df['BB_Upper'] = bb[bbu_col]
+    df['BB_Lower'] = bb[bbl_col]
+    df['BB_Mid'] = bb[bbm_col]
+    
+    # 횡보장 RSI 필터
+    df['RSI'] = ta.rsi(df['close'], length=14)
+    
+    return df.dropna()
+
+def run_backtest():
+    try:
+        df_raw = pd.read_csv(FILE_NAME)
+        df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'])
+    except:
+        print("파일 없음. 3분봉 수집 코드 실행 필요.")
+        return
+
+    df = prepare_data(df_raw)
+    balance = INITIAL_CAPITAL
+    
+    position = None 
+    trades = []     
+    win_count = 0
+    loss_count = 0
+
+    print(f"--- 하이브리드 스위칭 전략 테스트 ({len(df)} 캔들) ---")
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        curr_price = row['close']
+        
+        # 현재 시장 상태 판단 (Mode Switching)
+        # CHOP 지수가 50보다 낮으면 '추세장(Trend)', 높으면 '횡보장(Range)'
+        is_trend_mode = row['CHOP'] < CHOP_THRESHOLD
+        is_range_mode = not is_trend_mode
+        
+        # =========================================
+        # [A] 포지션 관리 (청산)
+        # =========================================
+        if position:
+            entry_price = position['entry_price']
+            amount = position['amount']
+            mode = position['mode'] # 진입할 때의 모드를 기억해야 함
+            
+            exit_price = 0
+            reason = ""
+            
+            # --- [1] 터틀 모드로 진입했던 포지션 ---
+            # 끝까지 먹어야 함
+            if mode == 'Turtle':
+                if row['low'] < row['Turtle_Low']:
+                    exit_price = row['Turtle_Low']
+                    if row['open'] < exit_price: exit_price = row['open']
+                    reason = "Turtle Exit"
+            
+            # --- [2] 횡보 모드로 진입했던 포지션 ---
+            # 짧게 먹고 빠져야 함
+            elif mode == 'Range':
+                # 익절: 중간선 도달
+                if row['high'] > row['BB_Mid']:
+                    exit_price = row['BB_Mid']
+                    reason = "Range TP"
+                
+                # 손절: -2%
+                elif row['low'] < entry_price * (1 - RANGE_SL):
+                    exit_price = entry_price * (1 - RANGE_SL)
+                    reason = "Range SL"
+            
+            # 청산 실행
+            if exit_price > 0:
+                pnl = (exit_price - entry_price) * amount - (exit_price * amount * FEE_RATE)
+                balance += pnl
+                
+                if pnl > 0: win_count += 1
+                else: loss_count += 1
+                
+                trades.append({
+                    'date': row['timestamp'],
+                    'type': reason,
+                    'pnl': pnl,
+                    'balance': balance,
+                    'mode': mode
+                })
+                position = None
+
+        # =========================================
+        # [B] 신규 진입 로직 (스위칭)
+        # =========================================
+        else:
+            if balance < 5: continue 
+
+            # --- [1] 추세장일 때 (Turtle Breakout) ---
+            if is_trend_mode:
+                if row['high'] > row['Turtle_High']:
+                    buy_price = row['Turtle_High']
+                    if row['open'] > buy_price: buy_price = row['open']
+                    
+                    invest_money = balance * ENTRY_RATIO
+                    qty = (invest_money * LEVERAGE) / buy_price
+                    balance -= (buy_price * qty * FEE_RATE)
+                    
+                    position = {
+                        'entry_price': buy_price,
+                        'amount': qty,
+                        'mode': 'Turtle'
+                    }
+            
+            # --- [2] 횡보장일 때 (Range Reversion) ---
+            elif is_range_mode:
+                # 밴드 하단 이탈 + 과매도(RSI < 30) -> 저점 매수
+                if row['close'] < row['BB_Lower'] and row['RSI'] < 30:
+                    buy_price = curr_price
+                    
+                    invest_money = balance * ENTRY_RATIO
+                    qty = (invest_money * LEVERAGE) / buy_price
+                    balance -= (buy_price * qty * FEE_RATE)
+                    
+                    position = {
+                        'entry_price': buy_price,
+                        'amount': qty,
+                        'mode': 'Range'
+                    }
+
+    # 결과 출력
+    trade_df = pd.DataFrame(trades)
+    if len(trades) == 0:
+        print("거래 없음")
+        return
+
+    total_return = ((balance - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
+    mdd = ((trade_df['balance'] - trade_df['balance'].cummax()) / trade_df['balance'].cummax() * 100).min()
+    
+    if (win_count + loss_count) > 0:
+        win_rate = win_count / (win_count + loss_count) * 100
+        avg_win = trade_df[trade_df['pnl'] > 0]['pnl'].mean()
+        avg_loss = trade_df[trade_df['pnl'] <= 0]['pnl'].mean()
+        rrr = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    else: 
+        win_rate = 0; rrr = 0
+
+    print("\n========== [하이브리드 스위칭 (Trend+Range) 결과] ==========")
+    print(f"전략: CHOP < 50 (추세 돌파) / CHOP >= 50 (횡보 역매매)")
+    print(f"목표: 횡보장 MDD 방어 + 추세장 수익 극대화")
+    print(f"---------------------------------------------")
+    print(f"최종 자본: ${balance:,.2f} (초기 $20)")
+    print(f"수익률: {total_return:.2f}%")
+    print(f"거래 횟수: {len(trade_df)}회")
+    print(f"승률: {win_rate:.2f}%")
+    print(f"손익비(RRR): 1 : {rrr:.2f}")
+    print(f"MDD: {mdd:.2f}%")
+    print("=============================================")
+    
+    if len(trade_df) > 0:
+        print(trade_df.tail(10)[['date', 'type', 'pnl', 'balance']])
+
+if __name__ == "__main__":
+    run_backtest()
